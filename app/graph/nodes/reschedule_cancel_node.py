@@ -6,7 +6,8 @@ from groq import Groq
 
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
-from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust
+from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
+from app.graph.nodes.faq_node import generate_faq_answer
 from app.services.calendar_service import (
     find_appointment_by_booking_id,
     cancel_appointment,
@@ -19,6 +20,23 @@ client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.J
 
 MAX_ID_ATTEMPTS = 2
 MAX_DATE_PARSE_ATTEMPTS = 2
+FAQ_CATEGORIES = {"appointments", "cancellation_policy", "insurance_billing", "hours", "new_patient"}
+OFF_TOPIC_CONFIDENCE_THRESHOLD = 0.5
+
+# rc_stage values that mean "no reschedule/cancel currently in progress" —
+# reaching this node from one of these means it's a brand new attempt, so
+# leftover state from a previous completed/abandoned attempt must be cleared.
+FRESH_START_STAGES = {None, "done"}
+
+RC_RESET_FIELDS = {
+    "rc_action": None,
+    "rc_booking_id": None,
+    "rc_id_attempts": 0,
+    "rc_appointment": None,
+    "rc_new_preferred_datetime": None,
+    "rc_proposed_slot_iso": None,
+    "rc_date_parse_attempts": 0,
+}
 
 
 class RCExtraction(BaseModel):
@@ -32,7 +50,8 @@ message for a reschedule or cancellation request. Only fill a field if
 stated in THIS message — leave others null. Normalize a spoken booking ID
 like "B P four eight two nine one three" into "BP482913". Do NOT invent or
 guess a booking_id if the caller's message doesn't contain one — leave it
-null in that case."""
+null in that case. Recognize casual affirmatives like 'yeah', 'yep', 'sure',
+'okay', 'that works' as confirms_action=true."""
 
 
 def extract_rc_info(message: str, stage: str) -> RCExtraction:
@@ -48,9 +67,10 @@ def extract_rc_info(message: str, stage: str) -> RCExtraction:
     elif stage in {"confirming_cancel", "confirming_reschedule"}:
         context_note = (
             "\n\nThe caller was just asked to confirm an action with yes/no. "
-            "Interpret 'yes', 'that works', 'correct' as confirms_action=true. "
-            "Interpret 'no', 'don't', 'wait' as confirms_action=false. This "
-            "turn is very unlikely to contain a booking ID — do not invent one."
+            "Interpret 'yes', 'yeah', 'that works', 'correct' as "
+            "confirms_action=true. Interpret 'no', 'don't', 'wait' as "
+            "confirms_action=false. This turn is very unlikely to contain a "
+            "booking ID — do not invent one."
         )
 
     def _call():
@@ -69,15 +89,20 @@ def extract_rc_info(message: str, stage: str) -> RCExtraction:
 
 
 def reschedule_cancel_node(state: ReceptionistState) -> dict:
-    stage_before = state.get("rc_stage", "lookup")
-    action = state.get("rc_action") or (
-        "cancel" if state.get("detected_category") == "cancel_appointment" else "reschedule"
-    )
+    stage_before = state.get("rc_stage")
+    is_fresh_start = stage_before in FRESH_START_STAGES
+    effective_stage = "lookup" if is_fresh_start else stage_before
 
-    extracted = extract_rc_info(state["current_message"], stage_before)
+    reset_fields = dict(RC_RESET_FIELDS) if is_fresh_start else {}
 
-    updates = {"rc_action": action}
-    if extracted.booking_id and stage_before == "lookup":
+    action = state.get("rc_action") if not is_fresh_start else None
+    action = action or ("cancel" if state.get("detected_category") == "cancel_appointment" else "reschedule")
+
+    extracted = extract_rc_info(state["current_message"], effective_stage)
+
+    updates = dict(reset_fields)
+    updates["rc_action"] = action
+    if extracted.booking_id and effective_stage == "lookup":
         updates["rc_booking_id"] = extracted.booking_id.upper().replace(" ", "")
     if extracted.new_preferred_datetime:
         updates["rc_new_preferred_datetime"] = extracted.new_preferred_datetime
@@ -93,23 +118,64 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
             "transcript": transcript + [{"role": "assistant", "content": text}],
         }
 
-    if stage_before == "lookup":
+    def resolve_confirm(current_stage_confirms):
+        if current_stage_confirms is not None:
+            return current_stage_confirms
+        return detect_confirmation_fallback(state["current_message"])
+
+    if effective_stage == "lookup":
         booking_id = merged.get("rc_booking_id")
+
         if not booking_id:
-            message = "Sure — could you give me your booking ID? It starts with BP followed by six digits."
-            return reply(message, rc_stage="lookup")
+            if is_fresh_start:
+                message = "Sure — could you give me your booking ID? It starts with BP followed by six digits."
+                return reply(message, rc_stage="lookup", rc_id_attempts=0)
 
-        appointment = find_appointment_by_booking_id(booking_id)
-        attempts = state.get("rc_id_attempts", 0)
+            attempts = state.get("rc_id_attempts", 0) + 1
 
-        if not appointment:
-            attempts += 1
+            detected_category = state.get("detected_category")
+            intent_confidence = state.get("intent_confidence", 0.0)
+            looks_off_topic = (
+                detected_category in FAQ_CATEGORIES
+                and intent_confidence >= OFF_TOPIC_CONFIDENCE_THRESHOLD
+            )
+
             if attempts >= MAX_ID_ATTEMPTS:
-                message = "I still can't find an appointment with that ID. Let me connect you with staff to help."
+                if looks_off_topic:
+                    answer, needs_escalation = generate_faq_answer(state["current_message"], detected_category)
+                    if needs_escalation or not answer:
+                        return reply(
+                            "Let me connect you with staff to help with that.",
+                            rc_stage="done", rc_id_attempts=attempts, escalated=True,
+                        )
+                    return reply(answer, rc_stage="done", rc_id_attempts=attempts, escalated=False)
+
+                message = "Let me connect you with staff to help you with that."
                 return reply(message, rc_stage="done", rc_id_attempts=attempts, escalated=True)
 
+            if looks_off_topic:
+                answer, needs_escalation = generate_faq_answer(state["current_message"], detected_category)
+                if needs_escalation or not answer:
+                    message = "Sure — could you give me your booking ID? It starts with BP followed by six digits."
+                    return reply(message, rc_stage="lookup", rc_id_attempts=attempts)
+
+                message = f"{answer} Now, could you give me your booking ID? It starts with BP followed by six digits."
+                return reply(message, rc_stage="lookup", rc_id_attempts=attempts)
+
+            message = "Sure — could you give me your booking ID? It starts with BP followed by six digits."
+            return reply(message, rc_stage="lookup", rc_id_attempts=attempts)
+
+        appointment = find_appointment_by_booking_id(booking_id)
+        id_attempts = state.get("rc_id_attempts", 0)
+
+        if not appointment:
+            id_attempts += 1
+            if id_attempts >= MAX_ID_ATTEMPTS:
+                message = "I still can't find an appointment with that ID. Let me connect you with staff to help."
+                return reply(message, rc_stage="done", rc_id_attempts=id_attempts, escalated=True)
+
             message = f"I couldn't find an appointment with the ID {booking_id} — could you double check it and say it again?"
-            return reply(message, rc_stage="lookup", rc_booking_id=None, rc_id_attempts=attempts)
+            return reply(message, rc_stage="lookup", rc_booking_id=None, rc_id_attempts=id_attempts)
 
         dt = datetime.fromisoformat(appointment["start"])
         action_word = "cancel" if action == "cancel" else "reschedule"
@@ -120,8 +186,9 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
         )
         return reply(message, rc_stage="confirm_details", rc_appointment=appointment, rc_id_attempts=0)
 
-    if stage_before == "confirm_details":
-        if extracted.confirms_action is True:
+    if effective_stage == "confirm_details":
+        confirms = resolve_confirm(extracted.confirms_action)
+        if confirms is True:
             if action == "cancel":
                 message = "Just to be sure — should I go ahead and cancel this appointment?"
                 return reply(message, rc_stage="confirming_cancel")
@@ -129,25 +196,26 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
                 message = "Great — what new date and time would you like instead?"
                 return reply(message, rc_stage="collecting_new_time")
 
-        if extracted.confirms_action is False:
+        if confirms is False:
             message = "No problem — let me connect you with staff to sort out the right appointment."
             return reply(message, rc_stage="done", escalated=True)
 
         message = "Sorry, is that the correct appointment — yes or no?"
         return reply(message, rc_stage="confirm_details")
 
-    if stage_before == "confirming_cancel":
-        if extracted.confirms_action is True:
+    if effective_stage == "confirming_cancel":
+        confirms = resolve_confirm(extracted.confirms_action)
+        if confirms is True:
             cancel_appointment(state["rc_appointment"]["event_id"])
             message = "Your appointment has been cancelled. Anything else I can help with?"
             return reply(message, rc_stage="done", escalated=False)
-        if extracted.confirms_action is False:
+        if confirms is False:
             message = "Okay, I've left that appointment as is. Anything else I can help with?"
             return reply(message, rc_stage="done", escalated=False)
         message = "Sorry, should I go ahead and cancel — yes or no?"
         return reply(message, rc_stage="confirming_cancel")
 
-    if stage_before == "collecting_new_time":
+    if effective_stage == "collecting_new_time":
         if not merged.get("rc_new_preferred_datetime"):
             message = "What new date and time would work for you?"
             return reply(message, rc_stage="collecting_new_time")
@@ -163,6 +231,11 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
 
             message = "I didn't catch that date and time — could you say it again, like 'next Tuesday at 3pm'?"
             return reply(message, rc_stage="collecting_new_time", rc_new_preferred_datetime=None, rc_date_parse_attempts=attempts)
+
+        if parsed_dt < datetime.now():
+            formatted = parsed_dt.strftime("%A, %B %d at %I:%M %p")
+            message = f"I'm sorry, {formatted} has already passed. Could you give me a date and time in the future?"
+            return reply(message, rc_stage="collecting_new_time", rc_new_preferred_datetime=None)
 
         if not is_within_business_hours(parsed_dt):
             formatted = parsed_dt.strftime("%A, %B %d at %I:%M %p")
@@ -182,8 +255,9 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
         message = f"I can move your appointment to {formatted} — does that work?"
         return reply(message, rc_stage="confirming_reschedule", rc_proposed_slot_iso=parsed_dt.isoformat(), rc_date_parse_attempts=0)
 
-    if stage_before == "confirming_reschedule":
-        if extracted.confirms_action is True:
+    if effective_stage == "confirming_reschedule":
+        confirms = resolve_confirm(extracted.confirms_action)
+        if confirms is True:
             new_slot = datetime.fromisoformat(state["rc_proposed_slot_iso"])
 
             if not check_availability(new_slot):
@@ -193,7 +267,7 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
             reschedule_appointment(state["rc_appointment"]["event_id"], new_slot)
             message = f"All set — your appointment is now {new_slot.strftime('%A, %B %d at %I:%M %p')}."
             return reply(message, rc_stage="done", escalated=False)
-        if extracted.confirms_action is False:
+        if confirms is False:
             message = "No problem — what other date and time would work?"
             return reply(message, rc_stage="collecting_new_time", rc_new_preferred_datetime=None, rc_proposed_slot_iso=None)
         message = "Sorry, does that new time work for you — yes or no?"

@@ -7,13 +7,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.graph.graph_builder import receptionist_graph
 from app.graph.nodes.greeting_node import greeting_node
 
-CALL_SID = "test-call-002"   # fresh thread so this run isn't influenced by the earlier conversation
+CALL_SID = "test-call-003"   # fresh thread so this run isn't influenced by earlier conversations
 
-# Only the questions that exercise faq_node's retrieval + rerank path —
-# the ones that hit the Cohere rate limit last time.
+# Tests the reschedule/cancel lookup-loop escalation fix: turn 1 asks for a
+# booking ID, turn 2 (still no ID given) asks again, turn 3 should escalate
+# instead of asking a third time.
 TEST_QUESTIONS = [
-    "I'm not sure, it's about my last visit",
-    "Something's wrong with my bill I think",
     "I need to cancel but it's been like a week since I was supposed to come in",
     "Do you have a pediatric dentist on staff?",
     "If I no-show twice will you guys drop me as a patient?",
@@ -28,7 +27,9 @@ def print_turn(user_input: str, result: dict):
         f"confidence={result.get('intent_confidence')} "
         f"is_emergency={result.get('is_emergency')} "
         f"needs_escalation={result.get('needs_escalation')} "
-        f"escalated={result.get('escalated')}"
+        f"escalated={result.get('escalated')} "
+        f"rc_stage={result.get('rc_stage')} "
+        f"rc_id_attempts={result.get('rc_id_attempts')}"
     )
 
 
@@ -44,8 +45,8 @@ def run_batch():
             config=config,
         )
         print_turn(question, result)
-        time.sleep(10)   # each faq_node turn can burn 2-3 Cohere calls (embed + up to 2 rerank);
-                          # trial limit is 10/min across the whole account, so pace conservatively
+        time.sleep(10)   # each faq_node/rc turn can burn multiple Groq/Cohere calls;
+                          # pace conservatively to stay under trial-tier rate limits
 
 
 def run_interactive():
@@ -70,7 +71,9 @@ def run_interactive():
             f"confidence={result.get('intent_confidence')} "
             f"is_emergency={result.get('is_emergency')} "
             f"needs_escalation={result.get('needs_escalation')} "
-            f"escalated={result.get('escalated')}"
+            f"escalated={result.get('escalated')} "
+            f"rc_stage={result.get('rc_stage')} "
+            f"rc_id_attempts={result.get('rc_id_attempts')}"
         )
 
 

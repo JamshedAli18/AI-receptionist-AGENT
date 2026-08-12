@@ -14,4 +14,4 @@ if __name__ == "__main__":
         print('='*60)
         results = retrieve_context(query, category=category)
         for i, r in enumerate(results, 1):
-            print(f"\n--- chunk {i} ---\n{r[:250]}...")
+            print(f"\n--- chunk {i} (score: {r['score']:.3f}) ---\n{r['text'][:250]}...")

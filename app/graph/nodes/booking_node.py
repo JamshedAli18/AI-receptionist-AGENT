@@ -7,7 +7,7 @@ from groq import Groq
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
 from app.graph.nodes.validators import is_valid_email, is_valid_name, is_valid_age, is_valid_reason
-from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust
+from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
 from app.services.calendar_service import check_availability, is_within_business_hours, create_appointment
 
 client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.JSON)
@@ -169,7 +169,11 @@ def booking_node(state: ReceptionistState) -> dict:
         }
 
     if stage == "confirming":
-        if extracted.wants_to_confirm is True and merged_state.get("proposed_slot_iso"):
+        wants_to_confirm = extracted.wants_to_confirm
+        if wants_to_confirm is None and stage_before == "confirming":
+            wants_to_confirm = detect_confirmation_fallback(state["current_message"])
+
+        if wants_to_confirm is True and merged_state.get("proposed_slot_iso"):
             slot_dt = datetime.fromisoformat(merged_state["proposed_slot_iso"])
 
             if not check_availability(slot_dt):
@@ -189,7 +193,7 @@ def booking_node(state: ReceptionistState) -> dict:
             )
             return reply(message, booking_stage="booked", booking_id=booking_id, booking_awaiting_field=None)
 
-        if extracted.wants_to_confirm is False:
+        if wants_to_confirm is False:
             message = "No problem — what date and time would work better for you?"
             return reply(
                 message,
@@ -233,6 +237,12 @@ def booking_node(state: ReceptionistState) -> dict:
 
         message = "I didn't quite catch that date and time — could you say it again, like 'next Tuesday at 3pm'?"
         return reply(message, preferred_datetime=None, date_parse_attempts=attempts, booking_awaiting_field=["preferred_datetime"], booking_stage="collecting")
+
+    from datetime import datetime as _dt
+    if parsed_dt < _dt.now():
+        formatted = parsed_dt.strftime("%A, %B %d at %I:%M %p")
+        message = f"I'm sorry, {formatted} has already passed. Could you give me a date and time in the future?"
+        return reply(message, preferred_datetime=None, booking_awaiting_field=["preferred_datetime"], booking_stage="collecting")
 
     if not is_within_business_hours(parsed_dt):
         formatted = parsed_dt.strftime("%A, %B %d at %I:%M %p")
