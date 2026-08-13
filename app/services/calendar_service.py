@@ -1,5 +1,8 @@
 import os
 import secrets
+import time
+import ssl
+import socket
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -7,6 +10,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
@@ -19,6 +23,27 @@ BUSINESS_HOURS = {
     5: (9, 13),
     6: None,
 }
+
+
+def _execute_with_retry(request, max_retries=3, base_wait=3):
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except (TimeoutError, ssl.SSLError, socket.timeout, ConnectionError) as e:
+            last_exc = e
+            wait = base_wait * (attempt + 1)
+            print(f"[calendar] network error, retrying in {wait}s... (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait)
+        except HttpError as e:
+            if e.resp.status in (500, 502, 503, 504):
+                last_exc = e
+                wait = base_wait * (attempt + 1)
+                print(f"[calendar] server error {e.resp.status}, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    raise last_exc
 
 
 def _localize(dt: datetime) -> datetime:
@@ -56,25 +81,12 @@ def check_availability(start_dt: datetime, duration_minutes: int = 30) -> bool:
         "timeZone": CLINIC_TIMEZONE,
         "items": [{"id": CALENDAR_ID}],
     }
-    result = service.freebusy().query(body=body).execute()
+    result = _execute_with_retry(service.freebusy().query(body=body))
     busy_slots = result["calendars"][CALENDAR_ID]["busy"]
     return len(busy_slots) == 0
 
 
-def find_next_available_slot(preferred_dt: datetime, duration_minutes: int = 30, max_days_ahead: int = 7) -> datetime | None:
-    candidate = _localize(preferred_dt)
-    limit = candidate + timedelta(days=max_days_ahead)
-
-    while candidate < limit:
-        if check_availability(candidate, duration_minutes):
-            return candidate
-        candidate += timedelta(minutes=30)
-    return None
-
-
 def generate_booking_id() -> str:
-    """Short, speakable booking ID — e.g. BP482913. Digits only after the
-    prefix so it's easy to say and hear correctly over a phone call."""
     digits = "".join(secrets.choice("0123456789") for _ in range(6))
     return f"BP{digits}"
 
@@ -82,10 +94,10 @@ def generate_booking_id() -> str:
 def create_appointment(
     start_dt: datetime,
     patient_name: str,
+    patient_email: str,
     reason: str,
     duration_minutes: int = 30,
 ) -> dict:
-    """Creates the event and returns {booking_id, event_id, link}."""
     booking_id = generate_booking_id()
     start_dt = _localize(start_dt)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
@@ -100,12 +112,13 @@ def create_appointment(
             "private": {
                 "booking_id": booking_id,
                 "patient_name": patient_name,
+                "patient_email": patient_email,
                 "reason": reason,
             }
         },
     }
 
-    created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+    created = _execute_with_retry(service.events().insert(calendarId=CALENDAR_ID, body=event))
     return {
         "booking_id": booking_id,
         "event_id": created["id"],
@@ -114,19 +127,17 @@ def create_appointment(
 
 
 def find_appointment_by_booking_id(booking_id: str) -> dict | None:
-    """Exact-match lookup via Calendar's private extended property — no
-    text-matching ambiguity, works even with duplicate patient names."""
     service = get_calendar_service()
     now = datetime.now(TZ)
 
-    events_result = service.events().list(
+    events_result = _execute_with_retry(service.events().list(
         calendarId=CALENDAR_ID,
         timeMin=now.isoformat(),
         privateExtendedProperty=f"booking_id={booking_id}",
         singleEvents=True,
         orderBy="startTime",
         maxResults=1,
-    ).execute()
+    ))
 
     items = events_result.get("items", [])
     if not items:
@@ -140,6 +151,7 @@ def find_appointment_by_booking_id(booking_id: str) -> dict | None:
         "event_id": event["id"],
         "booking_id": booking_id,
         "patient_name": props.get("patient_name", ""),
+        "patient_email": props.get("patient_email", ""),
         "reason": props.get("reason", ""),
         "start": start,
     }
@@ -147,7 +159,7 @@ def find_appointment_by_booking_id(booking_id: str) -> dict | None:
 
 def cancel_appointment(event_id: str) -> None:
     service = get_calendar_service()
-    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    _execute_with_retry(service.events().delete(calendarId=CALENDAR_ID, eventId=event_id))
 
 
 def reschedule_appointment(event_id: str, new_start_dt: datetime, duration_minutes: int = 30) -> str:
@@ -155,9 +167,9 @@ def reschedule_appointment(event_id: str, new_start_dt: datetime, duration_minut
     new_end_dt = new_start_dt + timedelta(minutes=duration_minutes)
     service = get_calendar_service()
 
-    event = service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    event = _execute_with_retry(service.events().get(calendarId=CALENDAR_ID, eventId=event_id))
     event["start"] = {"dateTime": new_start_dt.isoformat(), "timeZone": CLINIC_TIMEZONE}
     event["end"] = {"dateTime": new_end_dt.isoformat(), "timeZone": CLINIC_TIMEZONE}
 
-    updated = service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=event).execute()
+    updated = _execute_with_retry(service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=event))
     return updated.get("htmlLink", "")

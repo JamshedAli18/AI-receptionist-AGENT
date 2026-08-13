@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.mongodb import MongoDBSaver
 
+from app.config import MONGODB_URI
 from app.graph.state import ReceptionistState
 from app.graph.nodes.greeting_node import greeting_node
 from app.graph.nodes.intent_node import intent_node
@@ -11,6 +12,14 @@ from app.graph.nodes.booking_node import booking_node
 from app.graph.nodes.reschedule_cancel_node import reschedule_cancel_node
 from app.graph.nodes.end_call_node import end_call_node
 from app.graph.edges import route_after_intent, route_after_faq
+
+# Held at module level, deliberately never exited — this keeps the
+# underlying MongoClient connection alive for the entire process lifetime.
+# If this were a local variable inside build_graph(), Python would garbage
+# collect it once the function returns, silently closing the connection
+# on the very next graph invocation.
+_checkpointer_cm = MongoDBSaver.from_conn_string(MONGODB_URI)
+_checkpointer = _checkpointer_cm.__enter__()
 
 
 def build_graph():
@@ -51,8 +60,7 @@ def build_graph():
     graph.add_edge("reschedule_cancel_node", END)
     graph.add_edge("end_call_node", END)
 
-    checkpointer = MemorySaver()
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=_checkpointer)
 
 
 receptionist_graph = build_graph()

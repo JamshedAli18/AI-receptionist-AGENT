@@ -9,6 +9,8 @@ from app.graph.state import ReceptionistState
 from app.graph.nodes.validators import is_valid_email, is_valid_name, is_valid_age, is_valid_reason
 from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
 from app.services.calendar_service import check_availability, is_within_business_hours, create_appointment
+from app.services.patient_service import log_appointment_created
+from app.services.email_service import notify_clinic_new_booking, send_patient_booking_confirmation
 
 client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.JSON)
 
@@ -79,7 +81,10 @@ visit — leave reason_for_visit null for such messages.
 CRITICAL: A single message may legitimately contain several fields at once
 (e.g. "I'm Alex Johnson, 34 years old, and my email is alex@x.com") —
 extract all of them in that case. Only fill a field if the message clearly
-states it; don't guess or infer a value that wasn't actually said."""
+states it; don't guess or infer a value that wasn't actually said.
+
+Recognize casual affirmatives like 'yeah', 'yep', 'sure', 'okay', 'that
+works' as wants_to_confirm=true when relevant."""
 
 
 def extract_booking_info(message: str, booking_stage: str, awaiting_fields: Optional[list]) -> BookingExtraction:
@@ -170,7 +175,7 @@ def booking_node(state: ReceptionistState) -> dict:
 
     if stage == "confirming":
         wants_to_confirm = extracted.wants_to_confirm
-        if wants_to_confirm is None and stage_before == "confirming":
+        if wants_to_confirm is None:
             wants_to_confirm = detect_confirmation_fallback(state["current_message"])
 
         if wants_to_confirm is True and merged_state.get("proposed_slot_iso"):
@@ -183,9 +188,30 @@ def booking_node(state: ReceptionistState) -> dict:
             result = create_appointment(
                 start_dt=slot_dt,
                 patient_name=merged_state["patient_name"],
+                patient_email=merged_state["patient_email"],
                 reason=merged_state["reason_for_visit"],
             )
             booking_id = result["booking_id"]
+
+            log_appointment_created(
+                booking_id=booking_id,
+                event_id=result["event_id"],
+                patient_name=merged_state["patient_name"],
+                patient_age=merged_state["patient_age"],
+                patient_email=merged_state["patient_email"],
+                reason=merged_state["reason_for_visit"],
+                scheduled_time=slot_dt,
+            )
+
+            notify_clinic_new_booking(
+                booking_id, merged_state["patient_name"], merged_state["patient_age"],
+                merged_state["patient_email"], merged_state["reason_for_visit"], slot_dt,
+            )
+            send_patient_booking_confirmation(
+                merged_state["patient_email"], merged_state["patient_name"],
+                booking_id, slot_dt, merged_state["reason_for_visit"],
+            )
+
             message = (
                 f"You're all set — booked for {slot_dt.strftime('%A, %B %d at %I:%M %p')}. "
                 f"Your booking ID is {booking_id} — please save this, you'll need it if you "
@@ -214,8 +240,6 @@ def booking_node(state: ReceptionistState) -> dict:
             message = build_missing_fields_message(missing)
 
         if is_fresh_start:
-            # On the very first turn, the overview already lists everything
-            # needed — don't also repeat it in question form right after.
             message = (
                 "Sure, I can help you book an appointment. I'll need your full "
                 "name, age, email address, the reason for your visit, and your "
@@ -238,8 +262,7 @@ def booking_node(state: ReceptionistState) -> dict:
         message = "I didn't quite catch that date and time — could you say it again, like 'next Tuesday at 3pm'?"
         return reply(message, preferred_datetime=None, date_parse_attempts=attempts, booking_awaiting_field=["preferred_datetime"], booking_stage="collecting")
 
-    from datetime import datetime as _dt
-    if parsed_dt < _dt.now():
+    if parsed_dt < datetime.now():
         formatted = parsed_dt.strftime("%A, %B %d at %I:%M %p")
         message = f"I'm sorry, {formatted} has already passed. Could you give me a date and time in the future?"
         return reply(message, preferred_datetime=None, booking_awaiting_field=["preferred_datetime"], booking_stage="collecting")

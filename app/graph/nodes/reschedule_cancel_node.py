@@ -15,6 +15,11 @@ from app.services.calendar_service import (
     check_availability,
     is_within_business_hours,
 )
+from app.services.patient_service import log_appointment_rescheduled, log_appointment_cancelled
+from app.services.email_service import (
+    notify_clinic_reschedule, notify_clinic_cancellation,
+    send_patient_reschedule_confirmation, send_patient_cancellation_confirmation,
+)
 
 client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.JSON)
 
@@ -23,9 +28,6 @@ MAX_DATE_PARSE_ATTEMPTS = 2
 FAQ_CATEGORIES = {"appointments", "cancellation_policy", "insurance_billing", "hours", "new_patient"}
 OFF_TOPIC_CONFIDENCE_THRESHOLD = 0.5
 
-# rc_stage values that mean "no reschedule/cancel currently in progress" —
-# reaching this node from one of these means it's a brand new attempt, so
-# leftover state from a previous completed/abandoned attempt must be cleared.
 FRESH_START_STAGES = {None, "done"}
 
 RC_RESET_FIELDS = {
@@ -207,6 +209,18 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
         confirms = resolve_confirm(extracted.confirms_action)
         if confirms is True:
             cancel_appointment(state["rc_appointment"]["event_id"])
+            log_appointment_cancelled(state["rc_appointment"]["booking_id"])
+
+            notify_clinic_cancellation(
+                state["rc_appointment"]["booking_id"], state["rc_appointment"]["patient_name"],
+                datetime.fromisoformat(state["rc_appointment"]["start"]),
+            )
+            send_patient_cancellation_confirmation(
+                state["rc_appointment"]["patient_email"],
+                state["rc_appointment"]["patient_name"],
+                state["rc_appointment"]["booking_id"],
+            )
+
             message = "Your appointment has been cancelled. Anything else I can help with?"
             return reply(message, rc_stage="done", escalated=False)
         if confirms is False:
@@ -265,6 +279,18 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
                 return reply(message, rc_stage="collecting_new_time", rc_new_preferred_datetime=None, rc_proposed_slot_iso=None)
 
             reschedule_appointment(state["rc_appointment"]["event_id"], new_slot)
+            log_appointment_rescheduled(state["rc_appointment"]["booking_id"], new_slot)
+
+            notify_clinic_reschedule(
+                state["rc_appointment"]["booking_id"], state["rc_appointment"]["patient_name"],
+                datetime.fromisoformat(state["rc_appointment"]["start"]), new_slot,
+            )
+            send_patient_reschedule_confirmation(
+                state["rc_appointment"]["patient_email"],
+                state["rc_appointment"]["patient_name"],
+                state["rc_appointment"]["booking_id"], new_slot,
+            )
+
             message = f"All set — your appointment is now {new_slot.strftime('%A, %B %d at %I:%M %p')}."
             return reply(message, rc_stage="done", escalated=False)
         if confirms is False:
