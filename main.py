@@ -1,6 +1,11 @@
-def main():
-    print("Hello from voice-receptionist!")
+from fastapi import FastAPI
+from app.routes import voice
+
+app = FastAPI(title="BrightPath Clinic Voice Receptionist")
+
+app.include_router(voice.router)
 
 
-if __name__ == "__main__":
-    main()
+@app.get("/")
+def health_check():
+    return {"status": "ok", "service": "voice-receptionist"}

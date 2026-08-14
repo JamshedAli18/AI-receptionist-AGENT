@@ -2,12 +2,13 @@ from typing import Literal
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
+from instructor.v2.core.errors import IncompleteOutputException
 
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
 from app.graph.nodes.llm_utils import call_with_retry
 
-client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.JSON)
+client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.TOOLS)
 
 
 class IntentClassification(BaseModel):
@@ -52,28 +53,49 @@ clinic fact — staff, services, hours, policies, billing, or a specific
 provider — classify it into the matching category instead.
 
 Use "unclear" only when the caller seems to want help but you can't tell
-what kind. Set confidence honestly."""
+what kind. Set confidence honestly.
+
+Respond with ONLY the JSON object — no explanation, no reasoning, no extra
+text before or after it."""
 
 
-def intent_node(state: ReceptionistState) -> dict:
+def _classify(message: str) -> IntentClassification:
     def _call():
         return client.chat.completions.create(
             model=LLM_MODEL_FAST,
             response_model=IntentClassification,
             messages=[
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-                {"role": "user", "content": state["current_message"]},
+                {"role": "user", "content": message},
             ],
             temperature=0,
+            max_tokens=500,
             max_retries=2,
         )
 
-    result: IntentClassification = call_with_retry(_call)
+    return call_with_retry(_call)
+
+
+def intent_node(state: ReceptionistState) -> dict:
+    try:
+        result = _classify(state["current_message"])
+        category = result.category
+        is_emergency = result.is_emergency
+        confidence = result.confidence
+    except IncompleteOutputException:
+        # If the model's structured output keeps getting truncated even
+        # after retries, don't crash the whole call — degrade gracefully.
+        # "unclear" with low confidence routes to escalation_node, which is
+        # the safe, honest fallback rather than dropping the caller.
+        print("[intent_node] Classification failed after retries, falling back to unclear/escalation.")
+        category = "unclear"
+        is_emergency = False
+        confidence = 0.0
 
     return {
-        "detected_category": result.category,
-        "is_emergency": result.is_emergency,
-        "intent_confidence": result.confidence,
+        "detected_category": category,
+        "is_emergency": is_emergency,
+        "intent_confidence": confidence,
         "escalated": False,
         "needs_escalation": False,
         "transcript": state.get("transcript", []) + [{"role": "user", "content": state["current_message"]}],

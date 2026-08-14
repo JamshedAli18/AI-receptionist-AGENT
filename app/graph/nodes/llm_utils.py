@@ -1,6 +1,7 @@
 import time
 from datetime import datetime
 import dateparser
+from instructor.v2.core.errors import IncompleteOutputException
 
 
 def call_with_retry(fn, max_retries=4, base_wait=8):
@@ -8,6 +9,14 @@ def call_with_retry(fn, max_retries=4, base_wait=8):
     for attempt in range(max_retries):
         try:
             return fn()
+        except IncompleteOutputException as e:
+            # Transient generation cutoff — the model's structured output got
+            # truncated before instructor could parse it. Usually resolves
+            # on retry, sometimes needs a moment.
+            last_exc = e
+            wait = 3 * (attempt + 1)
+            print(f"[llm] incomplete output, retrying in {wait}s... (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait)
         except Exception as e:
             msg = str(e).lower()
             if "rate_limit" not in msg and "429" not in msg:

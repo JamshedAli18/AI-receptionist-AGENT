@@ -3,12 +3,13 @@ from typing import Optional
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
+from instructor.v2.core.errors import IncompleteOutputException
 
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
 from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
 from app.graph.nodes.faq_node import generate_faq_answer
-from app.services.calendar_service import (
+from app.mcp.calendar_tools import (
     find_appointment_by_booking_id,
     cancel_appointment,
     reschedule_appointment,
@@ -16,12 +17,12 @@ from app.services.calendar_service import (
     is_within_business_hours,
 )
 from app.services.patient_service import log_appointment_rescheduled, log_appointment_cancelled
-from app.services.email_service import (
+from app.mcp.email_tools import (
     notify_clinic_reschedule, notify_clinic_cancellation,
     send_patient_reschedule_confirmation, send_patient_cancellation_confirmation,
 )
 
-client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.JSON)
+client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.TOOLS)
 
 MAX_ID_ATTEMPTS = 2
 MAX_DATE_PARSE_ATTEMPTS = 2
@@ -80,10 +81,11 @@ def extract_rc_info(message: str, stage: str) -> RCExtraction:
             model=LLM_MODEL_FAST,
             response_model=RCExtraction,
             messages=[
-                {"role": "system", "content": EXTRACTION_PROMPT + context_note},
+                {"role": "system", "content": EXTRACTION_PROMPT + context_note + "\n\nRespond with ONLY the JSON object — no explanation, no extra text."},
                 {"role": "user", "content": message},
             ],
             temperature=0,
+            max_tokens=500,
             max_retries=2,
         )
 
@@ -100,7 +102,11 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
     action = state.get("rc_action") if not is_fresh_start else None
     action = action or ("cancel" if state.get("detected_category") == "cancel_appointment" else "reschedule")
 
-    extracted = extract_rc_info(state["current_message"], effective_stage)
+    try:
+        extracted = extract_rc_info(state["current_message"], effective_stage)
+    except IncompleteOutputException:
+        print("[reschedule_cancel_node] Extraction failed after retries, treating this turn as empty.")
+        extracted = RCExtraction()
 
     updates = dict(reset_fields)
     updates["rc_action"] = action

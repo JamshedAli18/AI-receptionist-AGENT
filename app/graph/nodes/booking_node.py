@@ -3,16 +3,17 @@ from typing import Optional
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
+from instructor.v2.core.errors import IncompleteOutputException
 
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
 from app.graph.nodes.validators import is_valid_email, is_valid_name, is_valid_age, is_valid_reason
 from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
-from app.services.calendar_service import check_availability, is_within_business_hours, create_appointment
+from app.mcp.calendar_tools import check_availability, is_within_business_hours, create_appointment
 from app.services.patient_service import log_appointment_created
-from app.services.email_service import notify_clinic_new_booking, send_patient_booking_confirmation
+from app.mcp.email_tools import notify_clinic_new_booking, send_patient_booking_confirmation
 
-client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.JSON)
+client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.TOOLS)
 
 MAX_DATE_PARSE_ATTEMPTS = 2
 
@@ -110,10 +111,11 @@ def extract_booking_info(message: str, booking_stage: str, awaiting_fields: Opti
             model=LLM_MODEL_FAST,
             response_model=BookingExtraction,
             messages=[
-                {"role": "system", "content": EXTRACTION_PROMPT + context_note},
+                {"role": "system", "content": EXTRACTION_PROMPT + context_note + "\n\nRespond with ONLY the JSON object — no explanation, no extra text."},
                 {"role": "user", "content": message},
             ],
             temperature=0,
+            max_tokens=500,
             max_retries=2,
         )
 
@@ -149,7 +151,11 @@ def booking_node(state: ReceptionistState) -> dict:
     effective_stage = "collecting" if is_fresh_start else stage_before
     awaiting_fields = None if is_fresh_start else state.get("booking_awaiting_field")
 
-    extracted = extract_booking_info(state["current_message"], effective_stage, awaiting_fields)
+    try:
+        extracted = extract_booking_info(state["current_message"], effective_stage, awaiting_fields)
+    except IncompleteOutputException:
+        print("[booking_node] Extraction failed after retries, treating this turn as empty.")
+        extracted = BookingExtraction()
 
     updates = dict(reset_fields)
     for field in ["patient_name", "patient_age", "patient_email", "reason_for_visit", "preferred_datetime"]:
