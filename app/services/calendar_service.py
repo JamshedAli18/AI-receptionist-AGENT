@@ -13,7 +13,19 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
+import base64
+import tempfile
+
+_service_account_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64")
+
+if _service_account_b64:
+    _decoded = base64.b64decode(_service_account_b64)
+    _temp_file = tempfile.NamedTemporaryFile(mode="wb", suffix=".json", delete=False)
+    _temp_file.write(_decoded)
+    _temp_file.close()
+    SERVICE_ACCOUNT_FILE = _temp_file.name
+else:
+    SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
 CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 CLINIC_TIMEZONE = os.environ.get("CLINIC_TIMEZONE", "America/New_York")
 TZ = ZoneInfo(CLINIC_TIMEZONE)

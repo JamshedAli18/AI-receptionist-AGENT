@@ -31,15 +31,16 @@ def login(body: LoginRequest, response: Response):
         key=COOKIE_NAME,
         value=token,
         httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 24,  # 24 hours, matches token expiry
+        secure=True,
+        samesite="none",
+        max_age=60 * 60 * 24,
     )
     return {"status": "ok"}
 
 
 @router.post("/logout")
 def logout(response: Response):
-    response.delete_cookie(COOKIE_NAME)
+    response.delete_cookie(COOKIE_NAME, samesite="none", secure=True)
     return {"status": "ok"}
 
 
