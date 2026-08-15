@@ -65,16 +65,44 @@ NEGATIVE_WORDS = {"no", "nope", "not", "don't", "dont", "wait", "cancel that",
                    "incorrect", "wrong"}
 
 
+NEGATION_OVERRIDE_PHRASES = {
+    "didn't work", "doesn't work", "does not work", "did not work",
+    "not work", "won't work", "will not work", "not correct", "not right",
+    "isn't right", "isn't correct", "that's wrong",
+}
+
+
 def detect_confirmation_fallback(text: str) -> bool | None:
-    """
-    Hardcoded safety net for yes/no detection — LLM extraction can miss
-    casual affirmatives like 'yeah'. Checked whenever the LLM's own
-    confirms_action/wants_to_confirm field comes back null on a turn where
-    a yes/no answer was expected.
-    """
-    normalized = text.strip().lower()
+    # Strip trailing punctuation before matching, so "Yes." / "Yes!" match
+    # the same as "Yes" — this was silently failing before.
+    normalized = text.strip().lower().rstrip(".!?")
+
+    # A negation phrase anywhere in the message overrides a leading "yes" —
+    # e.g. "yes, that didn't work for me" must be treated as a decline, not
+    # a confirmation. Check this BEFORE the positive-word check.
+    if any(phrase in normalized for phrase in NEGATION_OVERRIDE_PHRASES):
+        return False
+
     if any(normalized == w or normalized.startswith(w + " ") or normalized.startswith(w + ",") for w in POSITIVE_WORDS):
         return True
     if any(normalized == w or normalized.startswith(w + " ") or normalized.startswith(w + ",") for w in NEGATIVE_WORDS):
         return False
     return None
+
+
+ABANDON_PHRASES = {
+    "bye", "goodbye", "never mind", "nevermind", "forget it", "leave it",
+    "cancel that", "stop", "no thanks", "not interested", "i don't want",
+    "i dont want", "i changed my mind", "actually no", "skip it",
+}
+
+
+def detect_abandonment_fallback(text: str) -> bool:
+    """
+    Hardcoded safety net for callers trying to exit a flow (booking,
+    reschedule, cancel) — LLM extraction can fail to notice this across
+    several turns, leaving the caller stuck. Checked as a fallback when the
+    LLM's own abandonment signal comes back false/null.
+    """
+    normalized = text.strip().lower()
+    return any(phrase in normalized for phrase in ABANDON_PHRASES)

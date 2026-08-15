@@ -7,7 +7,7 @@ from instructor.v2.core.errors import IncompleteOutputException
 
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
-from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
+from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback, detect_abandonment_fallback
 from app.graph.nodes.faq_node import generate_faq_answer
 from app.mcp.calendar_tools import (
     find_appointment_by_booking_id,
@@ -46,6 +46,7 @@ class RCExtraction(BaseModel):
     booking_id: Optional[str] = Field(None, description="The booking ID the caller stated, normalized like 'BP482913' (letters + digits, no spaces), only if stated this turn")
     new_preferred_datetime: Optional[str] = Field(None, description="Requested new date/time, only if stated this turn")
     confirms_action: Optional[bool] = Field(None, description="True if caller is confirming (yes), False if declining (no), null if not answering a yes/no question")
+    wants_to_abandon: Optional[bool] = Field(None, description="True if the caller wants to stop/exit this reschedule or cancel process entirely — says bye, never mind, changed their mind, forget it")
 
 
 EXTRACTION_PROMPT = """Extract any new information from the caller's latest
@@ -53,8 +54,14 @@ message for a reschedule or cancellation request. Only fill a field if
 stated in THIS message — leave others null. Normalize a spoken booking ID
 like "B P four eight two nine one three" into "BP482913". Do NOT invent or
 guess a booking_id if the caller's message doesn't contain one — leave it
-null in that case. Recognize casual affirmatives like 'yeah', 'yep', 'sure',
-'okay', 'that works' as confirms_action=true."""
+null in that case.
+
+Set wants_to_abandon=true if the caller indicates they want to stop this
+process — saying goodbye, "never mind", "forget it", "leave it", "actually
+no", or similar. Check this independently on every message.
+
+Recognize casual affirmatives like 'yeah', 'yep', 'sure', 'okay', 'that
+works' as confirms_action=true."""
 
 
 def extract_rc_info(message: str, stage: str) -> RCExtraction:
@@ -107,6 +114,26 @@ def reschedule_cancel_node(state: ReceptionistState) -> dict:
     except IncompleteOutputException:
         print("[reschedule_cancel_node] Extraction failed after retries, treating this turn as empty.")
         extracted = RCExtraction()
+
+    wants_to_abandon = extracted.wants_to_abandon
+    if wants_to_abandon is None and not is_fresh_start:
+        wants_to_abandon = detect_abandonment_fallback(state["current_message"])
+
+    if wants_to_abandon:
+        message = "No problem, I'll leave that as is. Is there anything else I can help you with?"
+        return {
+            "response_text": message,
+            "rc_stage": "done",
+            "rc_action": None,
+            "rc_booking_id": None,
+            "rc_id_attempts": 0,
+            "rc_appointment": None,
+            "rc_new_preferred_datetime": None,
+            "rc_proposed_slot_iso": None,
+            "rc_date_parse_attempts": 0,
+            "escalated": False,
+            "transcript": state.get("transcript", []) + [{"role": "assistant", "content": message}],
+        }
 
     updates = dict(reset_fields)
     updates["rc_action"] = action

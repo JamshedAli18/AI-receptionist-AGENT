@@ -10,3 +10,9 @@ wheels/
 .venv
 .env
 credentials/
+
+# Next.js frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local

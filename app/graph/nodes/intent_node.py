@@ -41,11 +41,21 @@ INTENT_SYSTEM_PROMPT = """You classify a caller's message for a medical clinic
 voice receptionist. Always fill in is_emergency independently — it is a
 separate safety check, not derived from the category.
 
-Use "book_appointment" for a NEW appointment request. Use
-"reschedule_appointment" when the caller wants to change the time of an
-EXISTING appointment. Use "cancel_appointment" when they want to cancel an
-existing one. Use "appointments" only for general questions about types or
-policies, not an actual booking/reschedule/cancel request.
+Use "book_appointment" ONLY when the caller clearly wants to schedule a NEW
+visit right now (e.g. "I'd like to book an appointment", "can I come in
+Tuesday", "I need to see a doctor"). Use "reschedule_appointment" when they
+want to change an EXISTING appointment's time. Use "cancel_appointment" when
+they want to cancel an existing one.
+
+Use "appointments" for general questions about appointment types, policies,
+or hypotheticals — including anything phrased as "what happens if...",
+"what if I...", or questions about calling, missing, or being late to an
+appointment. These are informational questions, NOT booking requests, even
+if the word "appointment" or "call" appears in them.
+
+If a message is ambiguous, unclear, or a garbled/incomplete question (e.g.
+you can't tell what's actually being asked), use "unclear" with a low
+confidence score rather than guessing "book_appointment" as a default.
 
 Use "small_talk" ONLY for pure greetings or pleasantries with no actual
 question or request in them. If the message asks about or references any

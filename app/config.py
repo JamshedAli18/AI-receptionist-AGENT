@@ -18,6 +18,10 @@ RERANK_MODEL = "rerank-english-v3.0"
 LLM_MODEL_FAST = "llama-3.1-8b-instant"
 LLM_MODEL_QUALITY = "llama-3.3-70b-versatile"
 
+DEEPGRAM_API_KEY = os.environ["DEEPGRAM_API_KEY"]
+DEEPGRAM_TTS_MODEL = os.environ.get("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en")
+WHISPER_MODEL = "whisper-large-v3-turbo"
+
 CLINIC_TIMEZONE = os.environ.get("CLINIC_TIMEZONE", "America/New_York")
 
 MONGODB_URI = os.environ["MONGODB_URI"]
@@ -33,10 +37,8 @@ CLINIC_NOTIFICATION_EMAILS = [
 GMAIL_SMTP_USER = os.environ.get("GMAIL_SMTP_USER")
 GMAIL_SMTP_APP_PASSWORD = os.environ.get("GMAIL_SMTP_APP_PASSWORD")
 
-SIGNALWIRE_PROJECT_ID = os.environ.get("SIGNALWIRE_PROJECT_ID")
-SIGNALWIRE_API_TOKEN = os.environ.get("SIGNALWIRE_API_TOKEN")
-SIGNALWIRE_SPACE_URL = os.environ.get("SIGNALWIRE_SPACE_URL")
-SIGNALWIRE_PHONE_NUMBER = os.environ.get("SIGNALWIRE_PHONE_NUMBER")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+ADMIN_JWT_SECRET = os.environ.get("ADMIN_JWT_SECRET")
 
 TEST_PATIENT_EMAILS = [
     e.lower() for e in [

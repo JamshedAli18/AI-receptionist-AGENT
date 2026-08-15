@@ -9,7 +9,7 @@ def route_after_intent(state: ReceptionistState) -> str:
         return "escalation_node"
 
     # Stay in an in-progress booking flow regardless of this turn's intent
-    if state.get("booking_stage") in {"collecting", "confirming"}:
+    if state.get("booking_stage") in {"collecting", "confirming", "confirming_details"}:
         return "booking_node"
 
     # Stay in an in-progress reschedule/cancel flow regardless of intent

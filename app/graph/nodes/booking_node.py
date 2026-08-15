@@ -3,12 +3,11 @@ from typing import Optional
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
-from instructor.v2.core.errors import IncompleteOutputException
 
 from app.config import GROQ_API_KEY, LLM_MODEL_FAST
 from app.graph.state import ReceptionistState
-from app.graph.nodes.validators import is_valid_email, is_valid_name, is_valid_age, is_valid_reason
-from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback
+from app.graph.nodes.validators import is_valid_email, is_valid_name, is_valid_age, is_valid_reason, normalize_spoken_email, _extract_email
+from app.graph.nodes.llm_utils import call_with_retry, parse_datetime_robust, detect_confirmation_fallback, detect_abandonment_fallback
 from app.mcp.calendar_tools import check_availability, is_within_business_hours, create_appointment
 from app.services.patient_service import log_appointment_created
 from app.mcp.email_tools import notify_clinic_new_booking, send_patient_booking_confirmation
@@ -16,6 +15,7 @@ from app.mcp.email_tools import notify_clinic_new_booking, send_patient_booking_
 client = instructor.from_groq(Groq(api_key=GROQ_API_KEY), mode=instructor.Mode.TOOLS)
 
 MAX_DATE_PARSE_ATTEMPTS = 2
+MAX_CONFIRMATION_ATTEMPTS = 3
 
 FIELD_LABELS = {
     "patient_name": "their full name",
@@ -59,6 +59,7 @@ BOOKING_RESET_FIELDS = {
     "booking_id": None,
     "date_parse_attempts": 0,
     "booking_awaiting_field": None,
+    "booking_confirmation_attempts": 0,
 }
 
 
@@ -68,7 +69,8 @@ class BookingExtraction(BaseModel):
     patient_email: Optional[str] = Field(None, description="Caller's email address, only if stated this turn")
     reason_for_visit: Optional[str] = Field(None, description="Reason for the visit, only if stated this turn")
     preferred_datetime: Optional[str] = Field(None, description="Requested date/time in the caller's own words, only if stated this turn")
-    wants_to_confirm: Optional[bool] = Field(None, description="True if caller is confirming a proposed slot, False if declining, null if not answering a confirmation question")
+    wants_to_confirm: Optional[bool] = Field(None, description="True if caller is confirming something asked, False if declining/correcting, null if not answering a confirmation question")
+    wants_to_abandon: Optional[bool] = Field(None, description="True if the caller wants to stop/exit the booking process entirely — e.g. says bye, never mind, changed their mind, not interested, doesn't want to book anymore")
 
 
 EXTRACTION_PROMPT = """Extract any new booking details from the caller's latest
@@ -79,13 +81,20 @@ IMPORTANT: A message that only expresses wanting to book or schedule an
 appointment (e.g. "I'd like to book an appointment") is NOT a reason for
 visit — leave reason_for_visit null for such messages.
 
-CRITICAL: A single message may legitimately contain several fields at once
-(e.g. "I'm Alex Johnson, 34 years old, and my email is alex@x.com") —
-extract all of them in that case. Only fill a field if the message clearly
-states it; don't guess or infer a value that wasn't actually said.
+CRITICAL: A single message may legitimately contain several fields at once,
+including corrections to previously given information — extract all of them.
+Only fill a field if the message clearly states it; don't guess.
 
-Recognize casual affirmatives like 'yeah', 'yep', 'sure', 'okay', 'that
-works' as wants_to_confirm=true when relevant."""
+Set wants_to_abandon=true if the caller indicates they want to stop the
+booking process — saying goodbye, "never mind", "I don't want to book",
+"forget it", "leave it", "actually no", or similar. This should be checked
+independently on every message, regardless of what else is in it.
+
+Recognize casual affirmatives like 'yeah', 'yep', 'sure', 'okay', 'that's
+right', 'correct' as wants_to_confirm=true. Recognize 'no', 'wrong',
+'that's not right', 'incorrect' as wants_to_confirm=false — if the caller
+also restates a corrected value in the same message, capture it in the
+relevant field too."""
 
 
 def extract_booking_info(message: str, booking_stage: str, awaiting_fields: Optional[list]) -> BookingExtraction:
@@ -93,10 +102,17 @@ def extract_booking_info(message: str, booking_stage: str, awaiting_fields: Opti
     if booking_stage == "confirming":
         context_note = (
             "\n\nIMPORTANT: The caller was just offered a specific appointment "
-            "slot and asked if it works for them. Interpret words like 'yes', "
-            "'that works', 'sounds good', or 'sure' as wants_to_confirm=true. "
-            "Interpret 'no', 'that doesn't work', or a different time request "
-            "as wants_to_confirm=false."
+            "slot and asked if it works for them. Interpret confirmations as "
+            "wants_to_confirm=true, declines as false."
+        )
+    elif booking_stage == "confirming_details":
+        context_note = (
+            "\n\nIMPORTANT: The caller was just read back a full summary of "
+            "their booking details (name, age, email, reason, date/time) and "
+            "asked if everything is correct. 'Yes'/'correct' = "
+            "wants_to_confirm=true. 'No' or naming something wrong = "
+            "wants_to_confirm=false — capture any corrected value they give "
+            "in the same message (e.g. 'no, my email is actually x@y.com')."
         )
     elif awaiting_fields:
         labels = [FIELD_LABELS.get(f, f) for f in awaiting_fields]
@@ -111,7 +127,7 @@ def extract_booking_info(message: str, booking_stage: str, awaiting_fields: Opti
             model=LLM_MODEL_FAST,
             response_model=BookingExtraction,
             messages=[
-                {"role": "system", "content": EXTRACTION_PROMPT + context_note + "\n\nRespond with ONLY the JSON object — no explanation, no extra text."},
+                {"role": "system", "content": EXTRACTION_PROMPT + context_note},
                 {"role": "user", "content": message},
             ],
             temperature=0,
@@ -143,6 +159,14 @@ def build_missing_fields_message(missing: list[tuple[str, str]]) -> str:
     return f"Could you tell me {', '.join(labels[:-1])}, and {labels[-1]}?"
 
 
+def build_summary_message(state: dict) -> str:
+    return (
+        f"Let me confirm what I have: {state['patient_name']}, age {state['patient_age']}, "
+        f"email {state['patient_email']}, for {state['reason_for_visit']}, "
+        f"preferred time {state['preferred_datetime']}. Is all of that correct?"
+    )
+
+
 def booking_node(state: ReceptionistState) -> dict:
     stage_before = state.get("booking_stage")
     is_fresh_start = stage_before in FRESH_START_STAGES
@@ -151,24 +175,54 @@ def booking_node(state: ReceptionistState) -> dict:
     effective_stage = "collecting" if is_fresh_start else stage_before
     awaiting_fields = None if is_fresh_start else state.get("booking_awaiting_field")
 
-    try:
-        extracted = extract_booking_info(state["current_message"], effective_stage, awaiting_fields)
-    except IncompleteOutputException:
-        print("[booking_node] Extraction failed after retries, treating this turn as empty.")
-        extracted = BookingExtraction()
+    extracted = extract_booking_info(state["current_message"], effective_stage, awaiting_fields)
+
+    # Check for abandonment first, before anything else — a caller trying
+    # to exit the booking flow must always be able to, regardless of stage.
+    wants_to_abandon = extracted.wants_to_abandon
+    if wants_to_abandon is None and not is_fresh_start:
+        wants_to_abandon = detect_abandonment_fallback(state["current_message"])
+
+    if wants_to_abandon:
+        message = "No problem, I won't book anything. Is there anything else I can help you with?"
+        return {
+            "response_text": message,
+            "booking_stage": "done",
+            "booking_awaiting_field": None,
+            "patient_name": None,
+            "patient_age": None,
+            "patient_email": None,
+            "reason_for_visit": None,
+            "preferred_datetime": None,
+            "proposed_slot_iso": None,
+            "escalated": False,
+            "transcript": state.get("transcript", []) + [{"role": "assistant", "content": message}],
+        }
 
     updates = dict(reset_fields)
     for field in ["patient_name", "patient_age", "patient_email", "reason_for_visit", "preferred_datetime"]:
         value = getattr(extracted, field)
+
+        if field == "patient_email":
+            # Prefer deterministic regex extraction straight from the raw
+            # transcript — more reliable for "X at Y dot Z" voice patterns
+            # than hoping the LLM extraction preserved it correctly.
+            regex_email = _extract_email(state["current_message"])
+            if regex_email:
+                value = regex_email
+            elif value:
+                value = normalize_spoken_email(value)
+
         if not value:
             continue
+
         validator = FIELD_VALIDATORS.get(field)
         if validator and not validator(value):
             continue
         updates[field] = value
 
     merged_state = {**state, **updates}
-    stage = "confirming" if (not is_fresh_start and stage_before == "confirming") else "collecting"
+    stage = effective_stage if not is_fresh_start else "collecting"
     transcript = state.get("transcript", [])
 
     def reply(text, **extra):
@@ -238,6 +292,39 @@ def booking_node(state: ReceptionistState) -> dict:
         message = "Sorry, just to confirm — does that time work for you?"
         return reply(message, booking_stage="confirming")
 
+    if stage == "confirming_details":
+        wants_to_confirm = extracted.wants_to_confirm
+        if wants_to_confirm is None:
+            wants_to_confirm = detect_confirmation_fallback(state["current_message"])
+
+        if wants_to_confirm is True:
+            # Fall through below to date parsing / availability, using the
+            # now-confirmed field values.
+            pass
+        elif wants_to_confirm is False:
+            attempts = state.get("booking_confirmation_attempts", 0) + 1
+
+            if attempts >= MAX_CONFIRMATION_ATTEMPTS:
+                message = "I'm having trouble getting these details right — let me connect you with staff to finish this."
+                return reply(message, booking_stage="done", escalated=True, booking_confirmation_attempts=attempts)
+
+            # If the caller already restated a corrected value in this same
+            # message, it's already in `updates` above — just re-summarize
+            # with the new values. If they didn't specify anything, ask
+            # what needs fixing.
+            any_field_changed = any(
+                getattr(extracted, f) for f in ["patient_name", "patient_age", "patient_email", "reason_for_visit", "preferred_datetime"]
+            )
+            if any_field_changed:
+                message = build_summary_message(merged_state)
+                return reply(message, booking_stage="confirming_details", booking_confirmation_attempts=attempts)
+
+            message = "No problem — what would you like to correct? You can tell me your name, age, email, reason for visit, or date and time."
+            return reply(message, booking_stage="collecting", booking_confirmation_attempts=attempts, booking_awaiting_field=None)
+        else:
+            message = build_summary_message(merged_state)
+            return reply(message, booking_stage="confirming_details")
+
     missing = missing_or_invalid_fields(merged_state)
     if missing:
         if len(missing) == 1 and merged_state.get(missing[0][0]) and INVALID_MESSAGES.get(missing[0][0]):
@@ -254,6 +341,14 @@ def booking_node(state: ReceptionistState) -> dict:
             )
 
         return reply(message, booking_stage="collecting", booking_awaiting_field=[f for f, _ in missing])
+
+    # All fields present and valid. If we haven't yet read the full summary
+    # back for confirmation this round, do that now before touching the
+    # calendar at all.
+    if stage != "confirming_details" or extracted.wants_to_confirm is not True:
+        if stage == "collecting":
+            message = build_summary_message(merged_state)
+            return reply(message, booking_stage="confirming_details")
 
     parsed_dt = parse_datetime_robust(merged_state["preferred_datetime"])
 

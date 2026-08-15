@@ -39,3 +39,5 @@ class ReceptionistState(TypedDict, total=False):
     response_text: str
     escalated: bool
     call_ended: bool
+
+    booking_confirmation_attempts: int
