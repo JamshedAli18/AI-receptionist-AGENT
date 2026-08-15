@@ -1,4 +1,4 @@
-const ADMIN_API_BASE = "http://localhost:8000";
+const BASE = process.env.NEXT_PUBLIC_API_URL;
 
 export class AdminApiError extends Error {
   status: number;
@@ -13,7 +13,7 @@ export class AdminApiError extends Error {
 async function adminFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(`${ADMIN_API_BASE}${path}`, {
+    res = await fetch(`${BASE}${path}`, {
       ...options,
       credentials: "include",
       headers: {

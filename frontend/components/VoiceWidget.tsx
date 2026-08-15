@@ -34,7 +34,7 @@ export default function VoiceWidget() {
   function ensureConnected() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
 
-    const ws = new WebSocket(`ws://localhost:8000/ws/voice`);
+    const ws = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/voice`);
     ws.binaryType = "arraybuffer";
 
     ws.onopen = () => setConnected(true);
