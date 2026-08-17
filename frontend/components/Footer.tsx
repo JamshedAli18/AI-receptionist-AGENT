@@ -36,7 +36,9 @@ export default function Footer() {
             Staff Login
           </Link>
           <a
-            href="#"
+            href="https://github.com/JamshedAli18/AI-receptionist-AGENT"
+            target="_blank"
+            rel="noopener noreferrer"
             className="flex items-center gap-1.5 text-sm font-medium text-muted transition-colors hover:text-ink"
           >
             <GitFork className="h-4 w-4" />
